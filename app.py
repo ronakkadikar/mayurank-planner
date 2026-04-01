@@ -15,13 +15,10 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- CLOUD DATABASE CONNECTION (The Loop & Memory) ---
-# This connects securely to your Google Sheet
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Fetch the current memory (ttl=0 ensures it doesn't use stale cached data)
 try:
     master_db = conn.read(worksheet="Backlog", ttl=0)
-    # Drop empty rows that Google Sheets sometimes adds
     master_db = master_db.dropna(subset=['Job_ID']) 
 except Exception as e:
     st.error(f"Could not connect to Google Sheets. Error: {e}")
@@ -62,15 +59,12 @@ with tab1:
         new_data = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('xlsx') else pd.read_csv(uploaded_file)
         new_data['Remaining_Qty'] = new_data['Ordered_Qty']
         
-        # Combine old backlog with new orders
         updated_db = pd.concat([master_db, new_data], ignore_index=True)
-        # Remove any duplicates by Job ID (keeping the newest)
         updated_db = updated_db.drop_duplicates(subset=['Job_ID'], keep='last')
         
-        # Save back to Google Sheets
         conn.update(worksheet="Backlog", data=updated_db)
         st.success("Orders successfully saved to the Cloud Database!")
-        st.rerun() # Refresh the app
+        st.rerun()
 
 # --- TAB 2: ROUTING & PLANNING ---
 with tab2:
@@ -85,14 +79,20 @@ with tab2:
         dfs_schedule = generate_schedule(dfs_jobs, dfs_capacity)
         if not dfs_schedule.empty:
             display_cols = ['Job_ID', 'SKU', 'Category', 'Remaining_Qty', 'Est_Run_Time_Hrs', 'Production_Window']
-            st.dataframe(dfs_schedule[display_cols].format({'Est_Run_Time_Hrs': "{:.2f}"}), use_container_width=True)
+            # FIX: Added .style.format() instead of just .format()
+            st.dataframe(dfs_schedule[display_cols].style.format({'Est_Run_Time_Hrs': "{:.2f}"}), use_container_width=True)
+        else:
+            st.success("DFS Line has no pending jobs!")
         
         st.divider()
         
         st.markdown("<h3 class='sugar-header'>🍚 Dedicated Sugar Line Schedule</h3>", unsafe_allow_html=True)
         sugar_schedule = generate_schedule(sugar_jobs, sugar_capacity)
         if not sugar_schedule.empty:
-            st.dataframe(sugar_schedule[display_cols].format({'Est_Run_Time_Hrs': "{:.2f}"}), use_container_width=True)
+            # FIX: Added .style.format() instead of just .format()
+            st.dataframe(sugar_schedule[display_cols].style.format({'Est_Run_Time_Hrs': "{:.2f}"}), use_container_width=True)
+        else:
+            st.info("No Sugar jobs in the backlog.")
     else:
         st.info("The backlog is empty.")
 
@@ -112,12 +112,9 @@ with tab3:
             
             if st.form_submit_button("Update Cloud Database"):
                 new_remaining = max(0, expected_qty - actual_qty)
-                # Update the specific row in the dataframe
                 master_db.loc[master_db['Job_ID'] == selected_job, 'Remaining_Qty'] = new_remaining
                 
-                # Push the entire updated dataframe back to Google Sheets
                 conn.update(worksheet="Backlog", data=master_db)
                 st.success(f"Cloud updated! {selected_job} now has {new_remaining} remaining.")
-                # We don't use st.rerun() inside a form callback, user can just click another tab
     else:
         st.success("All jobs are completed!")
