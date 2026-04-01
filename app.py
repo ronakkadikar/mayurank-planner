@@ -27,9 +27,22 @@ except Exception as e:
 # --- CORE SCHEDULING LOGIC ---
 def generate_schedule(df, hourly_cap):
     if df.empty: return df
-    margin_weights = {'High': 3, 'Medium': 2, 'Low': 1}
+    
+    # 1. New 5-Tier Margin Weights
+    margin_weights = {'Very High': 5, 'High': 4, 'Medium': 3, 'Low': 2, 'Very Low': 1}
     df['Margin_Score'] = df['Margin_Class'].map(margin_weights).fillna(1)
-    df = df.sort_values(by=['Is_Urgent', 'Margin_Score', 'Client_Weight'], ascending=[False, False, False]).reset_index(drop=True)
+    
+    # 2. Process Delivery Date for Sorting
+    df['Delivery_Date'] = pd.to_datetime(df['Delivery_Date'], errors='coerce')
+    
+    # 3. New Advanced Sorting Logic
+    # Priority: Urgent -> Earliest Date -> Client Priority (1 is best) -> Margin (5 is best)
+    df = df.sort_values(
+        by=['Is_Urgent', 'Delivery_Date', 'Client_Priority', 'Margin_Score'],
+        ascending=[False, True, True, False]
+    ).reset_index(drop=True)
+    
+    # 4. Timing & Shift Allocation
     df['Est_Run_Time_Hrs'] = df['Remaining_Qty'] / hourly_cap
     df['Cumulative_Hrs'] = df['Est_Run_Time_Hrs'].cumsum()
     
@@ -39,6 +52,9 @@ def generate_schedule(df, hourly_cap):
         else: return "Pushed to Tomorrow"
             
     df['Production_Window'] = df['Cumulative_Hrs'].apply(assign_shift)
+    
+    # Format Date back to string for clean display
+    df['Delivery_Date'] = df['Delivery_Date'].dt.strftime('%Y-%m-%d')
     return df
 
 # --- USER INTERFACE ---
@@ -75,10 +91,11 @@ with tab2:
         sugar_jobs = pending_df[pending_df['Category'].str.lower() == 'sugar'].copy()
         dfs_jobs = pending_df[pending_df['Category'].str.lower() != 'sugar'].copy()
         
+        display_cols = ['Job_ID', 'SKU', 'Delivery_Date', 'Client_Priority', 'Margin_Class', 'Remaining_Qty', 'Est_Run_Time_Hrs', 'Production_Window']
+        
         st.markdown("<h3 class='dfs-header'>🚨 DFS Line Schedule (Bottleneck)</h3>", unsafe_allow_html=True)
         dfs_schedule = generate_schedule(dfs_jobs, dfs_capacity)
         if not dfs_schedule.empty:
-            display_cols = ['Job_ID', 'SKU', 'Category', 'Remaining_Qty', 'Est_Run_Time_Hrs', 'Production_Window']
             st.dataframe(dfs_schedule[display_cols].style.format({'Est_Run_Time_Hrs': "{:.2f}"}), use_container_width=True)
         else:
             st.success("DFS Line has no pending jobs!")
@@ -97,14 +114,11 @@ with tab2:
 # --- TAB 3: END OF DAY BULK OUTPUT ---
 with tab3:
     st.subheader("Bulk Record Actual Production")
-    st.write("Download the template, fill in the actual quantities produced today (leave skipped items blank), and upload it back.")
-    
     active_jobs = master_db[master_db['Remaining_Qty'] > 0].copy()
     
     if not active_jobs.empty:
-        # 1. Provide the Downloadable Template
         template_df = active_jobs[['Job_ID', 'SKU', 'Category', 'Remaining_Qty']].copy()
-        template_df['Actual_Produced'] = "" # Create an empty column for user input
+        template_df['Actual_Produced'] = ""
         
         st.download_button(
             label="📥 Download Today's EOD Template", 
@@ -115,34 +129,26 @@ with tab3:
         
         st.divider()
         
-        # 2. Upload the Completed Template
         eod_file = st.file_uploader("Upload Completed EOD Sheet (CSV/Excel)", type=['csv', 'xlsx'], key="eod_upload")
         
         if eod_file and st.button("Process Bulk EOD Data"):
             eod_data = pd.read_csv(eod_file) if eod_file.name.endswith('.csv') else pd.read_excel(eod_file)
             
-            # Data Validation
             if 'Job_ID' not in eod_data.columns or 'Actual_Produced' not in eod_data.columns:
-                st.error("Upload failed: The file must contain exactly the 'Job_ID' and 'Actual_Produced' columns from the template.")
+                st.error("Upload failed: Missing 'Job_ID' or 'Actual_Produced' columns.")
             else:
-                # Process the bulk update
                 updated_count = 0
                 for index, row in eod_data.iterrows():
                     job_id = str(row['Job_ID']).strip()
-                    
-                    # Treat blanks, NaN, or text as 0
                     actual = pd.to_numeric(row['Actual_Produced'], errors='coerce')
-                    if pd.isna(actual):
-                        actual = 0
+                    if pd.isna(actual): actual = 0
                         
-                    # Find the job in the master database and update it
                     if job_id in master_db['Job_ID'].astype(str).values:
                         expected = master_db.loc[master_db['Job_ID'].astype(str) == job_id, 'Remaining_Qty'].values[0]
                         new_remaining = max(0, expected - actual)
                         master_db.loc[master_db['Job_ID'].astype(str) == job_id, 'Remaining_Qty'] = new_remaining
                         updated_count += 1
                 
-                # Push the updated master database back to Google Sheets
                 conn.update(worksheet="Backlog", data=master_db)
                 st.success(f"Successfully processed {updated_count} jobs! The Cloud Database has been updated.")
                 
