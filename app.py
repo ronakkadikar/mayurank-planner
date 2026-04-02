@@ -2,17 +2,18 @@ import streamlit as st
 import pandas as pd
 from streamlit_gsheets import GSheetsConnection
 import numpy as np
+from datetime import datetime
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Mayurank ERP & Scheduler", layout="wide")
 st.markdown("""
     <style>
-    .stMetric { border: 1px solid #d3d3d3; padding: 15px; border-radius: 8px; background-color: #f9f9fa; }
+    .stMetric { border: 1px solid #d3d3d3; padding: 15px; border-radius: 8px; background-color: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
     h1 { color: #1E3A8A; }
     .sugar { color: #d97706; }
     .dfs { color: #059669; }
     .cup { color: #4338ca; }
-    .admin-box { border: 2px solid #dc2626; padding: 20px; border-radius: 10px; background-color: #fef2f2; }
+    .late-metric { color: #dc2626; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -28,24 +29,32 @@ except Exception as e:
 def process_mrp_and_schedule(df):
     if df.empty: return df, pd.DataFrame()
     
+    # 1. MRP (Material Check)
     df['Required_KG'] = (df['Remaining_Qty'] * df['Pack_Size_Grams']) / 1000
     df['Missing_KG'] = df['Required_KG'] - df['Bulk_Stock_KG']
     df['Missing_KG'] = df['Missing_KG'].apply(lambda x: max(0, x))
     df['Status'] = np.where(df['Missing_KG'] > 0, 'BLOCKED', 'READY')
-    
-    blocked_pos = df[df['Status'] == 'BLOCKED']['PO_Number'].unique()
     
     ready_df = df[df['Status'] == 'READY'].copy()
     blocked_df = df[df['Status'] == 'BLOCKED'].copy()
     
     if ready_df.empty: return ready_df, blocked_df
     
-    ready_df['Strict_PO_Delivery'] = ready_df['Strict_PO_Delivery'].astype(bool)
-    ready_df['Dispatch_Status'] = ready_df.apply(
-        lambda row: "⚠️ STAGE ONLY (PO Shortage)" if (row['Strict_PO_Delivery'] and row['PO_Number'] in blocked_pos) else "✅ Clear to Ship",
-        axis=1
-    )
+    # 2. IDENTIFY EXACT MISSING SKUS FOR STAGING
+    # Group the blocked items by PO and combine their SKU names into a string
+    missing_skus_dict = blocked_df.groupby('PO_Number')['SKU'].apply(lambda x: ', '.join(x)).to_dict()
     
+    ready_df['Strict_PO_Delivery'] = ready_df['Strict_PO_Delivery'].astype(bool)
+    
+    # Inject the missing SKUs into the Dispatch Status
+    def get_dispatch_status(row):
+        if row['Strict_PO_Delivery'] and row['PO_Number'] in missing_skus_dict:
+            return f"⚠️ STAGE ONLY (Missing: {missing_skus_dict[row['PO_Number']]})"
+        return "✅ Clear to Ship"
+        
+    ready_df['Dispatch_Status'] = ready_df.apply(get_dispatch_status, axis=1)
+    
+    # 3. HYBRID SCHEDULING LOGIC
     margin_weights = {'Very High': 5, 'High': 4, 'Medium': 3, 'Low': 2, 'Very Low': 1}
     ready_df['Margin_Score'] = ready_df['Margin_Class'].map(margin_weights).fillna(1)
     ready_df['Delivery_Date'] = pd.to_datetime(ready_df['Delivery_Date'], errors='coerce')
@@ -75,7 +84,7 @@ def process_mrp_and_schedule(df):
     return schedule_df, blocked_df
 
 def assign_timing(df, hourly_cap):
-    if df.empty: return df
+    if df.empty or hourly_cap == 0: return df
     df['Est_Run_Time_Hrs'] = df['Remaining_Qty'] / hourly_cap
     df['Cumulative_Hrs'] = df['Est_Run_Time_Hrs'].cumsum()
     df['Shift_Window'] = df['Cumulative_Hrs'].apply(
@@ -91,51 +100,67 @@ dfs_cap = st.sidebar.number_input("DFS Line (Pkts/Hr)", value=3750, step=100)
 sugar_cap = st.sidebar.number_input("Sugar Line (Pkts/Hr)", value=5000, step=500)
 cup_cap = st.sidebar.number_input("Cup Filler [Pulse/Rice] (Pkts/Hr)", value=2500, step=100)
 
-# Added 6th Tab for Admin Operations
-t1, t2, t3, t4, t5, t6 = st.tabs(["📊 1. Dashboard", "📥 2. Upload Orders", "🗓️ 3. Production Lines", "🛒 4. Procurement", "✅ 5. End of Day", "🗄️ 6. System Admin"])
+t1, t2, t3, t4, t5, t6 = st.tabs(["📊 1. Exec Dashboard", "📥 2. Upload Orders", "🗓️ 3. Production Lines", "🛒 4. Procurement", "✅ 5. End of Day", "🗄️ 6. System Admin"])
 
 pending_df = master_db[master_db['Remaining_Qty'] > 0].copy()
 ready_jobs, blocked_jobs = process_mrp_and_schedule(pending_df)
 
-# --- TAB 1: EXECUTIVE DASHBOARD ---
+# --- TAB 1: EXECUTIVE DASHBOARD (OVERHAULED) ---
 with t1:
-    st.subheader("📈 Active Roster Overview")
-    if not master_db.empty:
-        total_ordered = master_db['Ordered_Qty'].sum()
-        total_remaining = master_db['Remaining_Qty'].sum()
-        total_completed = total_ordered - total_remaining
-        completion_pct = (total_completed / total_ordered) * 100 if total_ordered > 0 else 0
+    st.subheader("📈 Operations Command Center")
+    if not pending_df.empty:
+        # 1. CORE HEALTH METRICS
+        today = pd.Timestamp.now().normalize()
+        pending_df['Delivery_Date'] = pd.to_datetime(pending_df['Delivery_Date'], errors='coerce')
         
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Current Roster Orders", f"{total_ordered:,} pkts")
-        m2.metric("Roster Completed", f"{total_completed:,} pkts")
-        m3.metric("Current Backlog", f"{total_remaining:,} pkts")
-        m4.metric("Roster Completion", f"{completion_pct:.1f}%")
+        total_pending_pkts = pending_df['Remaining_Qty'].sum()
+        late_jobs = pending_df[pending_df['Delivery_Date'] <= today]
+        late_count = len(late_jobs)
+        blocked_count = len(blocked_jobs)
         
-        st.progress(completion_pct / 100)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Active Jobs in Queue", f"{len(pending_df)}")
+        c2.metric("Total Pending Packets", f"{total_pending_pkts:,}")
+        c3.metric("🚨 Jobs Past Due / Due Today", f"{late_count}", help="Needs immediate Overtime or Expediting")
+        c4.metric("⚠️ Material Blocked Jobs", f"{blocked_count}", help="Waiting on Procurement")
+        
         st.divider()
         
-        col_chart1, col_chart2 = st.columns(2)
-        with col_chart1:
-            st.markdown("**Active Backlog by Category (Packets)**")
-            if not pending_df.empty:
-                cat_data = pending_df.groupby('Category')['Remaining_Qty'].sum()
-                st.bar_chart(cat_data, color="#1E3A8A")
-            else:
-                st.info("No active backlog.")
-                
-        with col_chart2:
-            st.markdown("**Procurement Readiness (Job Count)**")
-            if not pending_df.empty:
-                chart_df = pending_df.copy()
-                chart_df['Req'] = (chart_df['Remaining_Qty'] * chart_df['Pack_Size_Grams']) / 1000
-                chart_df['Status'] = np.where((chart_df['Req'] - chart_df['Bulk_Stock_KG']) > 0, 'Blocked (Missing Material)', 'Ready to Produce')
-                status_counts = chart_df['Status'].value_counts()
-                st.bar_chart(status_counts, color="#059669")
-            else:
-                st.info("No active jobs to analyze.")
+        # 2. BOTTLENECK LOAD ANALYSIS (Hours of Work)
+        st.markdown("### ⚙️ Machine Load (Backlog in Hours)")
+        st.write("Indicates how many hours of continuous running are required to clear the current queue.")
+        
+        sugar_qty = pending_df[pending_df['Category'].str.lower() == 'sugar']['Remaining_Qty'].sum()
+        cup_qty = pending_df[pending_df['Category'].str.lower().isin(['pulse', 'rice'])]['Remaining_Qty'].sum()
+        dfs_qty = pending_df[~pending_df['Category'].str.lower().isin(['sugar', 'pulse', 'rice'])]['Remaining_Qty'].sum()
+        
+        load_dfs = dfs_qty / dfs_cap if dfs_cap > 0 else 0
+        load_cup = cup_qty / cup_cap if cup_cap > 0 else 0
+        load_sugar = sugar_qty / sugar_cap if sugar_cap > 0 else 0
+        
+        lc1, lc2, lc3 = st.columns(3)
+        lc1.metric("DFS Line Load", f"{load_dfs:.1f} Hrs", delta=f"{load_dfs/8:.1f} Shifts" if load_dfs > 0 else "0", delta_color="inverse")
+        lc2.metric("Cup Filler Load", f"{load_cup:.1f} Hrs", delta=f"{load_cup/8:.1f} Shifts" if load_cup > 0 else "0", delta_color="inverse")
+        lc3.metric("Sugar Line Load", f"{load_sugar:.1f} Hrs", delta=f"{load_sugar/8:.1f} Shifts" if load_sugar > 0 else "0", delta_color="normal")
+
+        st.divider()
+
+        # 3. PROFITABILITY & RISK CHARTS
+        ch1, ch2 = st.columns(2)
+        with ch1:
+            st.markdown("**Backlog by Profit Margin (Packets)**")
+            margin_dist = pending_df.groupby('Margin_Class')['Remaining_Qty'].sum()
+            st.bar_chart(margin_dist, color="#059669")
+        with ch2:
+            st.markdown("**Order Status Breakdown**")
+            # Calculate what is Ready, Staged, and Blocked
+            status_summary = {"Clear to Produce": len(ready_jobs[~ready_jobs['Dispatch_Status'].str.contains("STAGE ONLY")])}
+            status_summary["Produce & Stage"] = len(ready_jobs[ready_jobs['Dispatch_Status'].str.contains("STAGE ONLY")])
+            status_summary["Blocked (Missing Material)"] = len(blocked_jobs)
+            st.bar_chart(pd.Series(status_summary), color="#1E3A8A")
+
     else:
-        st.info("No data in the system yet. Please upload orders.")
+        st.info("The factory floor is entirely clean! No pending orders.")
 
 # --- TAB 2: UPLOAD ---
 with t2:
@@ -222,33 +247,21 @@ with t5:
 
 # --- TAB 6: SYSTEM ADMIN & MONTHLY ARCHIVE ---
 with t6:
-    st.subheader("🗄️ Database Hygiene & Maintenance")
-    st.write("Over time, completed jobs will slow down the application. Use this routine at the end of the month to permanently move completed jobs (Remaining Qty = 0) out of the active database and into your historical Archive tab.")
-    
-    st.markdown("<div class='admin-box'>", unsafe_allow_html=True)
+    st.subheader("🗄️ Database Hygiene")
     completed_jobs = master_db[master_db['Remaining_Qty'] <= 0].copy()
-    
     if not completed_jobs.empty:
-        st.warning(f"**Action Required:** You have {len(completed_jobs)} fully completed jobs cluttering the active database.")
-        if st.button("🚨 Execute Monthly Archive Routine"):
+        st.warning(f"**Action Required:** You have {len(completed_jobs)} fully completed jobs to archive.")
+        if st.button("🚨 Execute Archive Routine"):
             try:
-                # 1. Fetch existing Archive
                 archive_db = conn.read(worksheet="Archive", ttl=0).dropna(subset=['Job_ID'])
-                # 2. Append newly completed jobs
                 updated_archive = pd.concat([archive_db, completed_jobs], ignore_index=True)
             except Exception:
-                # If Archive tab is completely empty, just use the completed jobs
                 updated_archive = completed_jobs
                 
-            # 3. Filter active backlog to keep ONLY pending jobs
             new_active_backlog = master_db[master_db['Remaining_Qty'] > 0]
-            
-            # 4. Push updates to both sheets simultaneously 
             conn.update(worksheet="Archive", data=updated_archive)
             conn.update(worksheet="Backlog", data=new_active_backlog)
-            
-            st.success(f"Success! {len(completed_jobs)} jobs have been permanently moved to the Archive sheet.")
+            st.success(f"Success! {len(completed_jobs)} jobs archived.")
             st.rerun()
     else:
-        st.success("✅ Your database is clean! There are no fully completed jobs to archive right now.")
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.success("✅ Database is clean.")
