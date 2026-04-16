@@ -30,6 +30,7 @@ except Exception as e:
 def process_mrp_and_schedule(df):
     if df.empty: return df, pd.DataFrame()
     
+    # 1. MRP (Material Check)
     df['Required_KG'] = (df['Remaining_Qty'] * df['Pack_Size_Grams']) / 1000
     df['Missing_KG'] = df['Required_KG'] - df['Bulk_Stock_KG']
     df['Missing_KG'] = df['Missing_KG'].apply(lambda x: max(0, x))
@@ -40,15 +41,30 @@ def process_mrp_and_schedule(df):
     
     if ready_df.empty: return ready_df, blocked_df
     
+    # 2. DEPARTMENT & ROUTING AUDIT
     def check_routing(row):
         line = str(row.get('Preferred_Line', '')).lower()
+        cat = str(row.get('Category', '')).lower()
+        
+        # Dept Cross-Contamination Check
+        dfs_cats = ['spice', 'dry fruit', 'flour', 'nut']
+        prs_cats = ['pulse', 'rice', 'sugar']
+        
+        if any(c in cat for c in dfs_cats) and ('prs' in line or 'sugar' in line):
+            return "❌ INVALID (DFS Item on PRS Line)"
+        if any(c in cat for c in prs_cats) and 'dfs' in line:
+            return "❌ INVALID (PRS Item on DFS Line)"
+            
+        # Cup Filler Check
         if 'cup' in line:
             if row['Pack_Size_Grams'] < 500 or row['Remaining_Qty'] < 300:
-                return "❌ INVALID (Move to Manual)"
+                return "❌ INVALID (<500g on Cup Filler)"
+                
         return "✅ OK"
     
     ready_df['Routing_Audit'] = ready_df.apply(check_routing, axis=1)
     
+    # 3. APPOINTMENT & DISPATCH LOGIC
     blocked_pos = blocked_df['PO_Number'].unique()
     missing_skus_dict = blocked_df.groupby('PO_Number')['SKU'].apply(lambda x: ', '.join(x)).to_dict()
     
@@ -67,6 +83,7 @@ def process_mrp_and_schedule(df):
         
     ready_df['Dispatch_Status'] = ready_df.apply(get_dispatch_status, axis=1)
     
+    # 4. PRIORITIZATION SORTING
     margin_weights = {'Very High': 5, 'High': 4, 'Medium': 3, 'Low': 2, 'Very Low': 1}
     ready_df['Margin_Score'] = ready_df['Margin_Class'].map(margin_weights).fillna(1)
     ready_df['Appointment_Date'] = pd.to_datetime(ready_df['Appointment_Date'], errors='coerce')
@@ -115,22 +132,22 @@ def calc_utilization(df, cap_per_hr, shift_hrs):
 st.title("🌐 Mayurank ERP: 6-Line MPS Simulator")
 
 # --- SIDEBAR: DYNAMIC CONTROLS ---
-st.sidebar.header("⚙️ Machine Capacities")
-cap_dfs_man = st.sidebar.number_input("DFS Manual (Pkts/Hr)", value=1500, step=100)
-cap_dfs_cup = st.sidebar.number_input("DFS Cup Filler (Pkts/Hr)", value=2500, step=100)
-cap_prs_man = st.sidebar.number_input("PRS Manual (Pkts/Hr)", value=1500, step=100)
-cap_prs_cup = st.sidebar.number_input("PRS Cup Filler (Pkts/Hr)", value=2500, step=100)
-cap_sugar = st.sidebar.number_input("Sugar FFS (Pkts/Hr)", value=5000, step=500)
-cap_horeca = st.sidebar.number_input("HoRECA (Pkts/Hr)", value=2000, step=100)
+st.sidebar.header("⚙️ Theoretical Capacities")
+cap_dfs_man = st.sidebar.number_input("DFS Manual (Pkts/Hr)", value=3750, step=100)
+cap_dfs_cup = st.sidebar.number_input("DFS Cup Filler (Pkts/Hr)", value=0, step=100)
+cap_prs_man = st.sidebar.number_input("PRS Manual (Pkts/Hr)", value=1250, step=100)
+cap_prs_cup = st.sidebar.number_input("PRS Cup Filler (Pkts/Hr)", value=0, step=100)
+cap_sugar = st.sidebar.number_input("Sugar FFS (Pkts/Hr)", value=1100, step=100)
+cap_horeca = st.sidebar.number_input("HoRECA (Pkts/Hr)", value=200, step=50)
 
 st.sidebar.divider()
 
-st.sidebar.header("🕒 Today's Shift Hours (OT)")
+st.sidebar.header("🕒 Today's Labor Allocation")
 st.sidebar.write("*8.0 = No OT. 11.0 = Max OT. 0 = Closed.*")
 hrs_dfs_man = st.sidebar.number_input("DFS Manual Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
-hrs_dfs_cup = st.sidebar.number_input("DFS Cup Filler Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_dfs_cup = st.sidebar.number_input("DFS Cup Filler Hrs", value=0.0, step=0.5, max_value=11.0, min_value=0.0)
 hrs_prs_man = st.sidebar.number_input("PRS Manual Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
-hrs_prs_cup = st.sidebar.number_input("PRS Cup Filler Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_prs_cup = st.sidebar.number_input("PRS Cup Filler Hrs", value=0.0, step=0.5, max_value=11.0, min_value=0.0)
 hrs_sugar = st.sidebar.number_input("Sugar FFS Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
 hrs_horeca = st.sidebar.number_input("HoRECA Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
 
@@ -160,10 +177,9 @@ with t1:
             line_df = ready_jobs[ready_jobs['Preferred_Line'].astype(str).str.lower() == line_name.lower()]
             hrs_needed, util = calc_utilization(line_df, cap, shift_hrs)
             
-            # Dynamic OT Status Logic per line
-            if shift_hrs == 0:
+            if shift_hrs == 0 or cap == 0:
                 color = "#94a3b8" # Grey
-                status_text = "LINE CLOSED"
+                status_text = "LINE CLOSED (Cap=0 or Hrs=0)"
             elif hrs_needed <= 8.0 and hrs_needed <= shift_hrs:
                 color = "#059669" # Green
                 status_text = "Standard Shift"
@@ -175,7 +191,7 @@ with t1:
                 status_text = f"OVERLOADED! Exceeds {shift_hrs}h"
                 
             with cols[idx % 3]:
-                st.markdown(f"<div style='border: 1px solid #d3d3d3; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 5px solid {color};'><h4>{line_name}</h4><p><b>Load:</b> {hrs_needed:.1f} Hrs</p><p><b>Status:</b> <span style='color: {color}; font-weight: bold;'>{status_text}</span></p><p style='font-size: 12px; color: gray; margin: 0;'>Available Today: {shift_hrs}h</p></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='border: 1px solid #d3d3d3; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 5px solid {color};'><h4>{line_name}</h4><p><b>Load:</b> {hrs_needed:.1f} Hrs</p><p><b>Status:</b> <span style='color: {color}; font-weight: bold;'>{status_text}</span></p><p style='font-size: 12px; color: gray; margin: 0;'>Labor Available Today: {shift_hrs}h</p></div>", unsafe_allow_html=True)
                 
         st.divider()
         
@@ -218,7 +234,7 @@ with t3:
             <ul style="list-style-type:none; padding-left:0;">
                 <li>🟦 <b>BLUE (LOCKED):</b> Appointment booked. Do not stop until 100% finished.</li>
                 <li>🟨 <b>YELLOW (STAGE):</b> Pack it, but leave boxes in staging area (waiting on missing PO items).</li>
-                <li>🟥 <b>RED (INVALID):</b> Planner error. <b>SKIP IT entirely.</b></li>
+                <li>🟥 <b>RED (INVALID):</b> Planner error (e.g., Wrong Dept). <b>SKIP IT entirely.</b></li>
                 <li>🔘 <b>GREY (PUSHED):</b> Shift is over. Ignore these jobs until tomorrow's shift.</li>
             </ul>
         </div>
@@ -233,7 +249,6 @@ with t3:
             elif "STAGE ONLY" in row.get('Dispatch_Status', ''): styles = ['background-color: #fef08a'] * len(row) 
             elif "LOCKED" in row.get('Dispatch_Status', ''): styles = ['background-color: #dbeafe'] * len(row) 
             
-            # Fade out pushed jobs (This overrides colors above if the shift is out of time)
             if "PUSHED" in row.get('Shift_Window', ''): styles = ['background-color: #f1f5f9; color: #94a3b8'] * len(row)
             return styles
 
@@ -241,7 +256,6 @@ with t3:
             with st.expander(f"🏭 {line} Schedule", expanded=True):
                 line_df = ready_jobs[ready_jobs['Preferred_Line'].astype(str).str.lower() == line.lower()].copy()
                 if not line_df.empty:
-                    # Apply Dynamic Timing Logic per line
                     line_df = assign_timing(line_df, config['cap'], config['hrs'])
                     st.dataframe(line_df[display_cols].style.apply(style_rows, axis=1), use_container_width=True)
                 else:
@@ -254,7 +268,6 @@ with t4:
     st.subheader("🛒 S.O.S. Procurement Dashboard")
     if not blocked_jobs.empty:
         st.error(f"WARNING: {len(blocked_jobs)} jobs are blocked by material shortages.")
-        
         buy_list = blocked_jobs.groupby('SKU')['Missing_KG'].sum().reset_index().sort_values(by='Missing_KG', ascending=False)
         st.dataframe(buy_list.style.format({'Missing_KG': "{:.1f} kg"}), use_container_width=True)
         
