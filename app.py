@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from streamlit_gsheets import GSheetsConnection
 import numpy as np
-import urllib.parse # Added for Email formatting
+import urllib.parse
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Mayurank MPS Simulator", layout="wide")
@@ -13,6 +13,8 @@ st.markdown("""
     .warning-text { color: #dc2626; font-weight: bold; }
     .admin-box { border: 2px solid #dc2626; padding: 20px; border-radius: 10px; background-color: #fef2f2; }
     .legend-box { background-color: #f8fafc; border: 1px solid #cbd5e1; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+    .custom-email-btn { background-color: #1E3A8A; color: white; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; text-decoration: none; display: inline-block; }
+    .custom-email-btn:hover { background-color: #1e40af; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -205,23 +207,22 @@ with t3:
     else:
         st.warning("No Clear-to-Build jobs available.")
 
-# --- TAB 4: PROCUREMENT (WITH EMAIL BUTTON) ---
+# --- TAB 4: PROCUREMENT (FIXED EMAIL BUTTON) ---
 with t4:
     st.subheader("🛒 S.O.S. Procurement Dashboard")
     st.write("These jobs have been stripped from the production schedule because the required bulk stock is missing.")
     if not blocked_jobs.empty:
         st.error(f"WARNING: {len(blocked_jobs)} jobs are blocked by material shortages.")
         
-        # 1. Show the list
         st.markdown("#### Aggregated Buying List:")
         buy_list = blocked_jobs.groupby('SKU')['Missing_KG'].sum().reset_index().sort_values(by='Missing_KG', ascending=False)
         st.dataframe(buy_list.style.format({'Missing_KG': "{:.1f} kg"}), use_container_width=True)
         
-        # 2. Email Button Logic
         st.markdown("### 📧 Notify Purchasing")
         st.write("Click the button below to instantly draft an email to the procurement team with these exact shortages.")
         
-        email_to = "purchase@mayurankfoods.com"
+        # Combined Email List
+        email_to = "purchase@mayurankfoods.com,somraj.mukherjee@ofbusiness.in,amit.goswami@ofbusiness.in"
         date_str = pd.Timestamp.now().strftime("%Y-%m-%d")
         email_subject = urllib.parse.quote(f"URGENT: Mayurank Raw Material Shortages - {date_str}")
         
@@ -233,11 +234,17 @@ with t4:
         email_body = urllib.parse.quote(body_text)
         mailto_link = f"mailto:{email_to}?subject={email_subject}&body={email_body}"
         
-        st.link_button("📤 Email purchase@mayurankfoods.com", mailto_link, type="primary")
+        # Raw HTML injection to force the mailto trigger in all browsers
+        st.markdown(f'''
+            <a href="{mailto_link}">
+                <button class="custom-email-btn">
+                    📤 Email Procurement Team
+                </button>
+            </a>
+        ''', unsafe_allow_html=True)
         
         st.divider()
         
-        # 3. Blocked Details
         st.markdown("#### Blocked Job Details (Why we need it):")
         st.dataframe(blocked_jobs[['PO_Number', 'SKU', 'Missing_KG', 'Delivery_Date']], use_container_width=True)
     else:
