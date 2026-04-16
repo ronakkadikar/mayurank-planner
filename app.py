@@ -81,31 +81,41 @@ def process_mrp_and_schedule(df):
     schedule_df['Sort_Date'] = pd.to_datetime(schedule_df['Sort_Date']).dt.strftime('%Y-%m-%d').fillna("Unscheduled")
     return schedule_df, blocked_df
 
-# New Dynamic Timing Function
-def assign_timing(df, hourly_cap):
+# --- DYNAMIC PER-LINE TIMING ---
+def assign_timing(df, hourly_cap, shift_hrs_today):
     if df.empty: 
         df['Shift_Window'] = ""
         return df
-    if hourly_cap == 0:
-        df['Shift_Window'] = "🔴 CAP=0"
+    if hourly_cap == 0 or shift_hrs_today == 0:
+        df['Shift_Window'] = "🔴 PUSHED (Line Closed)"
         return df
         
     df['Est_Run_Time_Hrs'] = df['Remaining_Qty'] / hourly_cap
     df['Cumulative_Hrs'] = df['Est_Run_Time_Hrs'].cumsum()
     
     def get_shift(x):
-        if x <= 8.0: return "🟢 Standard (0-8h)"
-        elif x <= 11.0: return "🟡 Overtime (8-11h)"
-        else: return "🔴 PUSHED (Tomorrow)"
+        if x <= 8.0 and x <= shift_hrs_today: 
+            return "🟢 Standard (0-8h)"
+        elif x > 8.0 and x <= shift_hrs_today: 
+            return f"🟡 Overtime (8-{shift_hrs_today}h)"
+        else: 
+            return "🔴 PUSHED (Tomorrow)"
         
     df['Shift_Window'] = df['Cumulative_Hrs'].apply(get_shift)
     return df
 
+def calc_utilization(df, cap_per_hr, shift_hrs):
+    if df.empty or cap_per_hr == 0 or shift_hrs == 0: return 0, 0
+    total_qty = df['Remaining_Qty'].sum()
+    hrs_needed = total_qty / cap_per_hr
+    util_pct = (hrs_needed / shift_hrs) * 100
+    return hrs_needed, util_pct
+
 # --- UI INTERFACE ---
 st.title("🌐 Mayurank ERP: 6-Line MPS Simulator")
 
-# --- SIDEBAR CAPACITIES ---
-st.sidebar.header("⚙️ Hourly Capacities")
+# --- SIDEBAR: DYNAMIC CONTROLS ---
+st.sidebar.header("⚙️ Machine Capacities")
 cap_dfs_man = st.sidebar.number_input("DFS Manual (Pkts/Hr)", value=1500, step=100)
 cap_dfs_cup = st.sidebar.number_input("DFS Cup Filler (Pkts/Hr)", value=2500, step=100)
 cap_prs_man = st.sidebar.number_input("PRS Manual (Pkts/Hr)", value=1500, step=100)
@@ -113,10 +123,24 @@ cap_prs_cup = st.sidebar.number_input("PRS Cup Filler (Pkts/Hr)", value=2500, st
 cap_sugar = st.sidebar.number_input("Sugar FFS (Pkts/Hr)", value=5000, step=500)
 cap_horeca = st.sidebar.number_input("HoRECA (Pkts/Hr)", value=2000, step=100)
 
-line_caps = {
-    "DFS Manual": cap_dfs_man, "DFS Cup Filler": cap_dfs_cup,
-    "PRS Manual": cap_prs_man, "PRS Cup Filler": cap_prs_cup,
-    "Sugar FFS": cap_sugar, "HoRECA": cap_horeca
+st.sidebar.divider()
+
+st.sidebar.header("🕒 Today's Shift Hours (OT)")
+st.sidebar.write("*8.0 = No OT. 11.0 = Max OT. 0 = Closed.*")
+hrs_dfs_man = st.sidebar.number_input("DFS Manual Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_dfs_cup = st.sidebar.number_input("DFS Cup Filler Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_prs_man = st.sidebar.number_input("PRS Manual Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_prs_cup = st.sidebar.number_input("PRS Cup Filler Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_sugar = st.sidebar.number_input("Sugar FFS Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+hrs_horeca = st.sidebar.number_input("HoRECA Hrs", value=8.0, step=0.5, max_value=11.0, min_value=0.0)
+
+line_configs = {
+    "DFS Manual": {"cap": cap_dfs_man, "hrs": hrs_dfs_man},
+    "DFS Cup Filler": {"cap": cap_dfs_cup, "hrs": hrs_dfs_cup},
+    "PRS Manual": {"cap": cap_prs_man, "hrs": hrs_prs_man},
+    "PRS Cup Filler": {"cap": cap_prs_cup, "hrs": hrs_prs_cup},
+    "Sugar FFS": {"cap": cap_sugar, "hrs": hrs_sugar},
+    "HoRECA": {"cap": cap_horeca, "hrs": hrs_horeca}
 }
 
 t1, t2, t3, t4, t5, t6 = st.tabs(["📊 1. Dashboard", "📥 2. Upload", "🗓️ 3. The 6-Line Schedule", "🛒 4. Procurement", "✅ 5. End of Day", "🗄️ 6. System Admin"])
@@ -124,41 +148,42 @@ t1, t2, t3, t4, t5, t6 = st.tabs(["📊 1. Dashboard", "📥 2. Upload", "🗓�
 pending_df = master_db[master_db['Remaining_Qty'] > 0].copy()
 ready_jobs, blocked_jobs = process_mrp_and_schedule(pending_df)
 
-# --- TAB 1: DASHBOARD & BOOKING RADAR ---
+# --- TAB 1: DASHBOARD ---
 with t1:
     st.subheader("⚙️ Line Load & Overtime Simulator")
-    st.write("Calculated against an 8-Hour Standard Shift. Maximum allowed Overtime is 3 Hours (11 Hours Total).")
     if not ready_jobs.empty:
         cols = st.columns(3)
-        for idx, (line_name, cap) in enumerate(line_caps.items()):
-            line_df = ready_jobs[ready_jobs['Preferred_Line'].astype(str).str.lower() == line_name.lower()]
-            total_qty = line_df['Remaining_Qty'].sum()
-            hrs = (total_qty / cap) if cap > 0 else 0
+        for idx, (line_name, config) in enumerate(line_configs.items()):
+            cap = config['cap']
+            shift_hrs = config['hrs']
             
-            # Dynamic OT Status Logic
-            if hrs <= 8.0:
+            line_df = ready_jobs[ready_jobs['Preferred_Line'].astype(str).str.lower() == line_name.lower()]
+            hrs_needed, util = calc_utilization(line_df, cap, shift_hrs)
+            
+            # Dynamic OT Status Logic per line
+            if shift_hrs == 0:
+                color = "#94a3b8" # Grey
+                status_text = "LINE CLOSED"
+            elif hrs_needed <= 8.0 and hrs_needed <= shift_hrs:
                 color = "#059669" # Green
                 status_text = "Standard Shift"
-            elif hrs <= 11.0:
+            elif hrs_needed <= shift_hrs:
                 color = "#d97706" # Yellow
-                status_text = f"Requires {hrs-8:.1f}h OT"
+                status_text = f"OT Authorized"
             else:
                 color = "#dc2626" # Red
-                status_text = f"OVERLOADED! Exceeds 11h"
+                status_text = f"OVERLOADED! Exceeds {shift_hrs}h"
                 
             with cols[idx % 3]:
-                st.markdown(f"<div style='border: 1px solid #d3d3d3; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 5px solid {color};'><h4>{line_name}</h4><p><b>Load:</b> {hrs:.1f} Hrs</p><p><b>Status:</b> <span style='color: {color}; font-weight: bold;'>{status_text}</span></p></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='border: 1px solid #d3d3d3; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 5px solid {color};'><h4>{line_name}</h4><p><b>Load:</b> {hrs_needed:.1f} Hrs</p><p><b>Status:</b> <span style='color: {color}; font-weight: bold;'>{status_text}</span></p><p style='font-size: 12px; color: gray; margin: 0;'>Available Today: {shift_hrs}h</p></div>", unsafe_allow_html=True)
                 
         st.divider()
         
         st.markdown("### 📞 Appointment Booking Radar")
-        st.write("These POs do not have a fixed appointment yet. Here is whether it is safe to call the client to lock a date.")
         unbooked_df = pending_df[~pending_df['Is_Appointment_Fixed'].astype(bool)].copy()
         
         if not unbooked_df.empty:
-            po_group = unbooked_df.groupby('PO_Number').agg({
-                'Delivery_Date': 'min', 'Missing_KG': 'sum' 
-            }).reset_index()
+            po_group = unbooked_df.groupby('PO_Number').agg({'Delivery_Date': 'min', 'Missing_KG': 'sum'}).reset_index()
             def booking_advice(row):
                 if row['Missing_KG'] > 0: return "❌ DO NOT BOOK (Missing Materials)"
                 return "✅ SAFE TO BOOK (-48 Hrs from Expiry)"
@@ -194,7 +219,7 @@ with t3:
                 <li>🟦 <b>BLUE (LOCKED):</b> Appointment booked. Do not stop until 100% finished.</li>
                 <li>🟨 <b>YELLOW (STAGE):</b> Pack it, but leave boxes in staging area (waiting on missing PO items).</li>
                 <li>🟥 <b>RED (INVALID):</b> Planner error. <b>SKIP IT entirely.</b></li>
-                <li>🔘 <b>GREY (PUSHED):</b> The 11-hour daily limit is reached. Ignore these until tomorrow.</li>
+                <li>🔘 <b>GREY (PUSHED):</b> Shift is over. Ignore these jobs until tomorrow's shift.</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -208,16 +233,16 @@ with t3:
             elif "STAGE ONLY" in row.get('Dispatch_Status', ''): styles = ['background-color: #fef08a'] * len(row) 
             elif "LOCKED" in row.get('Dispatch_Status', ''): styles = ['background-color: #dbeafe'] * len(row) 
             
-            # Fade out pushed jobs regardless of their appointment status
+            # Fade out pushed jobs (This overrides colors above if the shift is out of time)
             if "PUSHED" in row.get('Shift_Window', ''): styles = ['background-color: #f1f5f9; color: #94a3b8'] * len(row)
             return styles
 
-        for line, cap in line_caps.items():
+        for line, config in line_configs.items():
             with st.expander(f"🏭 {line} Schedule", expanded=True):
                 line_df = ready_jobs[ready_jobs['Preferred_Line'].astype(str).str.lower() == line.lower()].copy()
                 if not line_df.empty:
                     # Apply Dynamic Timing Logic per line
-                    line_df = assign_timing(line_df, cap)
+                    line_df = assign_timing(line_df, config['cap'], config['hrs'])
                     st.dataframe(line_df[display_cols].style.apply(style_rows, axis=1), use_container_width=True)
                 else:
                     st.info(f"No jobs assigned to {line}.")
